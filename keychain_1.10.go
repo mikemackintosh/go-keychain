@@ -1,20 +1,48 @@
 // +build darwin
-// +build go1.10
 
-package keychain
+package main
 
 // See https://developer.apple.com/library/ios/documentation/Security/Reference/keychainservices/index.html for the APIs used below.
 
 // Also see https://developer.apple.com/library/ios/documentation/Security/Conceptual/keychainServConcepts/01introduction/introduction.html .
 
 /*
-#cgo LDFLAGS: -framework CoreFoundation -framework Security
+#cgo CFLAGS: -mmacosx-version-min=10.6 -D__MAC_OS_X_VERSION_MAX_ALLOWED=1080
+#cgo LDFLAGS: -framework Security -framework CoreFoundation
 
+#include <errno.h>
+#include <sys/sysctl.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreFoundation/CFBase.h>
 #include <Security/Security.h>
+
+OSStatus CreateCertAndIdentity(SecCertificateRef certificate, SecIdentityRef *identity) {
+    OSStatus ret = noErr;
+    ret = SecIdentityCreateWithCertificate(NULL, certificate, identity);
+    if (ret != noErr) {
+       return ret;
+    }
+    return noErr;
+}
+
+OSStatus SetPreferredIdentity(SecIdentityRef identity, CFStringRef name) {
+		OSStatus ret = noErr;
+		ret = SecIdentitySetPreferred(identity, name, NULL);
+		if (ret != noErr) {
+			 return ret;
+		}
+		return noErr;
+}
 */
 import "C"
-import "fmt"
+import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/rsa"
+	"crypto/x509"
+	"fmt"
+	"time"
+)
 
 // Error defines keychain errors
 type Error int
@@ -40,6 +68,8 @@ var (
 	ErrorDecode = Error(C.errSecDecode)
 	// ErrorNoSuchKeychain corresponds to errSecNoSuchKeychain result code
 	ErrorNoSuchKeychain = Error(C.errSecNoSuchKeychain)
+	// ErrorNoSuchAttribute corresponds to errSecNoSuchAttr result code
+	ErrorNoSuchAttribute = Error(C.errSecNoSuchAttr)
 )
 
 func checkError(errCode C.OSStatus) error {
@@ -71,9 +101,11 @@ func (k Error) Error() string {
 
 // SecClass is the items class code
 type SecClass int
+type SecValueRef bool
+type SecReturnRef string
 
 // Keychain Item Classes
-var (
+const (
 	/*
 		kSecClassGenericPassword item attributes:
 		 kSecAttrAccess (OS X only)
@@ -82,13 +114,94 @@ var (
 		 kSecAttrAccount
 		 kSecAttrService
 	*/
-	SecClassGenericPassword SecClass = 1
+	SecClassGenericPassword SecClass = (1 << iota)
+
+	/*
+		kSecClassCertificate item attributes:
+			kSecAttrCertificateType
+			kSecAttrCertificateEncoding
+			kSecAttrLabel
+			kSecAttrSubject
+			kSecAttrIssuer
+			kSecAttrSerialNumber
+			kSecAttrSubjectKeyID
+			kSecAttrPublicKeyHash
+	*/
+	SecClassCertificate SecClass = (1 << iota)
+
+	/*
+		kSecClassKey item attributes:
+			kSecAttrAccess (OS X only)
+			kSecAttrAccessGroup (iOS only)
+			kSecAttrAccessible (iOS only)
+			kSecAttrKeyClass
+			kSecAttrLabel
+			kSecAttrApplicationLabel
+			kSecAttrIsPermanent
+			kSecAttrApplicationTag
+			kSecAttrKeyType
+			kSecAttrPRF
+			kSecAttrSalt
+			kSecAttrRounds
+			kSecAttrKeySizeInBits
+			kSecAttrEffectiveKeySize
+			kSecAttrCanEncrypt
+			kSecAttrCanDecrypt
+			kSecAttrCanDerive
+			kSecAttrCanSign
+			kSecAttrCanVerify
+			kSecAttrCanWrap
+			kSecAttrCanUnwrap
+
+			Note that the attributes kSecAttrCan* describe attributes of the
+			key itself at relatively high level. Some of these attributes are
+			mathematical -- for example, a DSA key cannot encrypt. Others are
+			key-level policy issues -- for example, it is good cryptographic
+			hygiene to use an RSA key either for encryption or signing but not
+			both. Compare these to the certificate-level policy values in
+			SecPolicy.h.
+	*/
+	SecClassKey SecClass = (1 << iota)
+
+	/*
+		kSecClassIdentity item attributes:
+			Since an identity is the combination of a private key and a
+			certificate, this class shares attributes of both kSecClassKey and
+			kSecClassCertificate.
+	*/
+	SecClassIdentity SecClass = (1 << iota)
 )
 
-// SecClassKey is the key type for SecClass
-var SecClassKey = attrKey(C.CFTypeRef(C.kSecClass))
+const (
+	/*
+		As defined in cssmtype.h
+			AddItem needs these values as CFStrings, but passing them directly
+			causes an invalid pc panic and an Unsupported value type: main._Ctype_CFStringRef
+			for the kSecAttrKeyType. To solve this problem, we create them as strings
+			and cast them to CFString in the dictionary
+	*/
+
+	// SecAttrKeyTypeRSA from cssmtype, CSSM_ALGID_RSA
+	SecAttrKeyTypeRSA = "42"
+
+	// SecAttrKeyTypeEC from cssmtype, CSSM_ALGID_ECDSA
+	SecAttrKeyTypeEC = "73"
+)
+
+// SecClassClassKey is the key type for SecClass
+var SecClassClassKey = attrKey(C.CFTypeRef(C.kSecClass))
+
+// SecValueRef is the key type for SecClass
+var SecValueRefKey = attrKey(C.CFTypeRef(C.kSecValueRef))
+
+// SecReturnRef is the key type for SecClass
+var SecReturnRefKey = attrKey(C.CFTypeRef(C.kSecReturnRef))
+
 var secClassTypeRef = map[SecClass]C.CFTypeRef{
 	SecClassGenericPassword: C.CFTypeRef(C.kSecClassGenericPassword),
+	SecClassCertificate:     C.CFTypeRef(C.kSecClassCertificate),
+	SecClassKey:             C.CFTypeRef(C.kSecClassKey),
+	SecClassIdentity:        C.CFTypeRef(C.kSecClassIdentity),
 }
 
 var (
@@ -104,6 +217,30 @@ var (
 	DataKey = attrKey(C.CFTypeRef(C.kSecValueData))
 	// DescriptionKey is for kSecAttrDescription
 	DescriptionKey = attrKey(C.CFTypeRef(C.kSecAttrDescription))
+	// SubjectKey is for kSecAttrSubject
+	SubjectKey = attrKey(C.CFTypeRef(C.kSecAttrSubject))
+	// IssuerKey is for kSecAttrSubject
+	IssuerKey = attrKey(C.CFTypeRef(C.kSecAttrIssuer))
+	// SerialNumberKey is for kSecAttrSerialNumber
+	SerialNumberKey = attrKey(C.CFTypeRef(C.kSecAttrSerialNumber))
+	// PublicKeyHashKey is for kSecAttrPublicKeyHash
+	PublicKeyHashKey = attrKey(C.CFTypeRef(C.kSecAttrPublicKeyHash))
+	// ApplicationTagKey is for kSecAttrApplicationTag
+	ApplicationTagKey = attrKey(C.CFTypeRef(C.kSecAttrApplicationTag))
+	// KeyTypeKey is for kSecAttrKeyType
+	KeyTypeKey = attrKey(C.CFTypeRef(C.kSecAttrKeyType))
+	// KeySizeInBitsKey is for kSecAttrKeySizeInBits
+	KeySizeInBitsKey = attrKey(C.CFTypeRef(C.kSecAttrKeySizeInBits))
+	// IsPermanentKey is for kSecAttrIsPermanent
+	IsPermanentKey = attrKey(C.CFTypeRef(C.kSecAttrIsPermanent))
+	// PrivateKeyAttrsKey is for kSecPrivateKeyAttrs
+	PrivateKeyAttrsKey = attrKey(C.CFTypeRef(C.kSecPrivateKeyAttrs))
+	// PublicKeyAttrsKey is for kSecPublicKeyAttrs
+	PublicKeyAttrsKey = attrKey(C.CFTypeRef(C.kSecPublicKeyAttrs))
+	// IsExtractableKey is for kSecAttrIsExtractable
+	IsExtractableKey = attrKey(C.CFTypeRef(C.kSecAttrIsExtractable))
+	// KeyClassKey is for kSecAttrKeyClass
+	KeyClassKey = attrKey(C.CFTypeRef(C.kSecAttrKeyClass))
 )
 
 // Synchronizable is the items synchronizable status
@@ -186,7 +323,22 @@ type Item struct {
 
 // SetSecClass sets the security class
 func (k *Item) SetSecClass(sc SecClass) {
-	k.attr[SecClassKey] = secClassTypeRef[sc]
+	k.attr[SecClassClassKey] = secClassTypeRef[sc]
+}
+
+// SetSecReturnRef sets the returned reference indicator
+func (k *Item) SetSecReturnRef(sc bool) {
+	k.attr[SecReturnRefKey] = sc
+}
+
+// SetSecValueRef sets the security class
+func (k *Item) SetSecValueRef(sc interface{}) {
+	k.attr[SecValueRefKey] = sc
+}
+
+// SetSecValueData sets the data class
+func (k *Item) SetSecValueData(sc C.CFDataRef) {
+	k.attr[DataKey] = sc
 }
 
 // SetString sets a string attibute for a string key
@@ -230,6 +382,50 @@ func (k *Item) SetData(b []byte) {
 // SetAccessGroup sets the access group attribute
 func (k *Item) SetAccessGroup(ag string) {
 	k.SetString(AccessGroupKey, ag)
+}
+
+// SetApplicationTag sets the access group attribute
+func (k *Item) SetApplicationTag(at string) {
+	k.SetString(ApplicationTagKey, at)
+}
+
+// SetKeySizeInBits sets the access group attribute
+func (k *Item) SetKeySizeInBits(size int) {
+	k.SetString(KeySizeInBitsKey, fmt.Sprintf("%d", size))
+}
+
+// SetPrivateKeyAttrs sets the private key
+func (k *Item) SetPrivateKeyAttrs(pk Item) {
+	cfDict, _ := ConvertMapToCFDictionary(pk.attr)
+	defer Release(C.CFTypeRef(cfDict))
+	k.attr[PrivateKeyAttrsKey] = cfDict
+}
+
+// SetPublicKeyAttrs sets the public key
+func (k *Item) SetPublicKeyAttrs(pk Item) {
+	cfDict, _ := ConvertMapToCFDictionary(pk.attr)
+	defer Release(C.CFTypeRef(cfDict))
+	k.attr[PublicKeyAttrsKey] = cfDict
+}
+
+// SetIsPermanent sets the permenance key
+func (k *Item) SetIsPermanent(b bool) {
+	k.attr[IsPermanentKey] = b
+}
+
+// SetIsExtractable sets the extractable key
+func (k *Item) SetIsExtractable(b bool) {
+	k.attr[IsExtractableKey] = b
+}
+
+// SetKeyType sets the keytype
+func (k *Item) SetKeyType(s string) {
+	k.SetString(KeyTypeKey, s)
+}
+
+// SetKeyClass sets the key class (private, public or symetric)
+func (k *Item) SetKeyClass(s C.CFStringRef) {
+	k.attr[KeyClassKey] = C.CFTypeRef(s)
 }
 
 // SetSynchronizable sets the synchronizable attribute
@@ -291,6 +487,93 @@ func NewGenericPassword(service string, account string, label string, data []byt
 	return item
 }
 
+type SecIdent struct {
+	Ref C.SecIdentityRef
+}
+
+// AssignIdentity will assign a SecIdentityRef to a named service requiring the identity
+func (s *SecIdent) AssignIdentity(preferred []string) error {
+	for _, pref := range preferred {
+		str, err := StringToCFString(pref)
+		if err != nil {
+			return err
+		}
+
+		err = checkError(C.SetPreferredIdentity(s.Ref, str))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// NewIdentityCertificate creates a new identity from the supplied certificate
+func NewIdentityCertificate(certificate []byte) (*SecIdent, error) {
+	var secident *SecIdent
+	// Convert the certificate byte data to CFData
+	certData, err := BytesToCFData(certificate)
+	if err != nil {
+		return secident, fmt.Errorf("Invalid certificate payload provided")
+	}
+
+	// Parse the certificate data
+	myCertRef, err := C.SecCertificateCreateWithData(nil, C.CFDataRef(certData))
+	if err != nil {
+		return secident, fmt.Errorf("Unable to parse certificate payload")
+	}
+
+	// Add the certificate to the keychain
+	dictionary := NewItem()
+	dictionary.SetSecClass(SecClassCertificate)
+	dictionary.SetSecReturnRef(true)
+	dictionary.SetSecValueRef(myCertRef)
+
+	// Create a new SecIdentity for inclusion later
+	var myIdentityRef C.SecIdentityRef
+	mySecRef := C.CFTypeRef(myIdentityRef)
+	err = AddItemToChain(dictionary, &mySecRef)
+	if err != nil {
+		return secident, fmt.Errorf("Unable to add certificate to keychain: %s", err)
+	}
+
+	err = checkError(C.CreateCertAndIdentity(C.SecCertificateRef(myCertRef), &myIdentityRef))
+	switch err {
+	case ErrorItemNotFound:
+		return secident, fmt.Errorf("This item requires a private key that has not be added to the keychain")
+	case ErrorDuplicateItem:
+		return secident, fmt.Errorf("This item already exists in the keychain")
+	}
+
+	if err != nil {
+		return secident, fmt.Errorf("Unable to add create identity with certificate: %s", err)
+	}
+
+	secident.Ref = myIdentityRef
+	return secident, nil
+}
+
+// AddKeyPair will create a new public and private key entry using the name parameter
+func AddKeyPair(name string, privateKey []byte, keyType string) error {
+	var keyType string
+	if keyType != SecAttrKeyTypeEC && keyType != SecAttrKeyTypeRSA {
+		return fmt.Errorf("Unsupported key type. Only RSA and EC private keys are supported.")
+	}
+
+	// Create new private key item
+	privKeyItem := NewItem()
+	privKeyItem.SetSecClass(SecClassKey)
+	privKeyItem.SetKeyType(keyType)
+	privKeyItem.SetApplicationTag(name)
+	privKeyItem.SetData(privateKey)
+	privKeyItem.SetKeyClass(C.kSecAttrKeyClassPrivate)
+	err := AddItem(privKeyItem)
+	if err != nil {
+		return fmt.Errorf("Unable to add private key: %s with error: %s", name, err)
+	}
+
+	return nil
+}
+
 // AddItem adds a Item to a Keychain
 func AddItem(item Item) error {
 	cfDict, err := ConvertMapToCFDictionary(item.attr)
@@ -300,6 +583,19 @@ func AddItem(item Item) error {
 	defer Release(C.CFTypeRef(cfDict))
 
 	errCode := C.SecItemAdd(cfDict, nil)
+	err = checkError(errCode)
+	return err
+}
+
+// AddItemToChain adds a Item to a Keychain
+func AddItemToChain(item Item, chain *C.CFTypeRef) error {
+	cfDict, err := ConvertMapToCFDictionary(item.attr)
+	if err != nil {
+		return err
+	}
+	defer Release(C.CFTypeRef(cfDict))
+
+	errCode := C.SecItemAdd(cfDict, chain)
 	err = checkError(errCode)
 	return err
 }
